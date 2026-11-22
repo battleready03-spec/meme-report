@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""
+Meme coin screener: rates tokens AVOID / HIGH RISK / WATCHLIST.
+
+It does NOT trade and does NOT predict prices. It checks the warning signs
+that can be read from public market data (liquidity, age, trading pattern,
+pump/dump behavior, supply) and flags tokens that are dangerous.
+No rating means "buy". WATCHLIST just means no red flags were found in the
+data it can see.
+
+Uses free public APIs, no keys, no extra installs:
+  CoinGecko    -> established meme coins (DOGE, SHIB, PEPE, ...)
+  DexScreener  -> any token on a DEX, by name, ticker or contract address
+
+Usage:
+  py memecoin_screener.py scan                 (top 30 meme coins)
+  py memecoin_screener.py scan --top 50 --detail
+  py memecoin_screener.py check PEPE
+  py memecoin_screener.py check <contract address>   (most reliable)
+
+NOT financial advice.
+"""
+import argparse
+import json
+import os
+import statistics
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import date
+
+HEADERS = {"User-Agent": "Mozilla/5.0 memecoin-screener", "Accept": "application/json"}
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "meme_state.json")
+RANK = {"AVOID": 0, "HIGH RISK": 1, "WATCHLIST": 2}
+
+
+# ---------------------------------------------------------------- http
+def http_json(url, retries=2):
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < retries:
+                print("Rate limited, waiting...")
+                time.sleep(15 * (attempt + 1))
+                continue
+            sys.exit(f"HTTP error {e.code} from {url.split('?')[0]}")
+        except Exception as e:
+            if attempt < retries:
+                time.sleep(2)
+                continue
+            sys.exit(f"Could not reach {url.split('?')[0]}: {e}")
+
+
+# ------------------------------------------------------------- helpers
+def num(x, default=0.0):
+    try:
+        return float(x) if x is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def usd(x):
+    x = num(x)
+    for div, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(x) >= div:
+            return f"${x / div:.1f}{suffix}"
+    return f"${x:.0f}"
+
+
+def pct(x):
+    return "n/a" if x is None else f"{num(x):+.0f}%"
+
+
+def ascii_name(text, fallback):
+    """Plain-ASCII label so tables line up; falls back to the coin id."""
+    t = str(text or "").encode("ascii", "ignore").decode().strip()
+    return t or str(fallback or "?")
+
+
+class Result:
+    """Starts at 50. Reasons move the score. Hard flags force AVOID."""
+
+    def __init__(self, label):
+        self.label = label
+        self.raw = 50
+        self.notes = []
+        self.hard = []
+        self.cap = False      # True = can never rate better than HIGH RISK
+
+    def add(self, pts, text):
+        self.raw += pts
+        self.notes.append((pts, text))
+
+    def avoid(self, text):
+        self.hard.append(text)
+
+    @property
+    def score(self):
+        return max(0, min(100, self.raw))
+
+    @property
+    def verdict(self):
+        if self.hard or self.score < 35:
+            return "AVOID"
+        if self.score < 60 or self.cap:
+            return "HIGH RISK"
+        return "WATCHLIST"
+
+    def show(self, indent="  "):
+        for text in self.hard:
+            print(f"{indent}[!!] {text}")
+        for pts, text in sorted(self.notes, key=lambda n: n[0]):
+            tag = "[+] " if pts > 0 else "[-] "
+            print(f"{indent}{tag}{text}")
+
+
+# ------------------------------------------------- established (CoinGecko)
+def score_gecko(c):
+    r = Result(f"{c.get('name')} ({str(c.get('symbol', '')).upper()})")
+    mc = num(c.get("market_cap"))
+    vol = num(c.get("total_volume"))
+    ch7 = c.get("price_change_percentage_7d_in_currency")
+    ch30 = c.get("price_change_percentage_30d_in_currency")
+    ath = c.get("ath_change_percentage")
+    circ, total = num(c.get("circulating_supply")), num(c.get("total_supply"))
+
+    if mc >= 1e9:
+        r.add(15, f"Large market cap ({usd(mc)}): deep, established market")
+    elif mc >= 1e8:
+        r.add(8, f"Mid market cap ({usd(mc)})")
+    elif mc >= 1e7:
+        r.add(-5, f"Small market cap ({usd(mc)}): easy to move either way")
+    else:
+        r.add(-20, f"Tiny market cap ({usd(mc)}): very easy to manipulate")
+
+    ratio = vol / mc if mc else 0
+    if ratio < 0.01:
+        r.add(-10, f"Very low trading volume ({ratio:.1%} of cap daily): hard to exit")
+    elif ratio > 0.5:
+        r.add(-10, f"Volume is {ratio:.0%} of cap in one day: frothy or wash trading")
+    else:
+        r.add(5, "Healthy trading volume relative to size")
+
+    if ch30 is None:
+        r.add(-10, "No 30-day price data available")
+    else:
+        if ch30 > 100:
+            r.add(-12, f"Up {pct(ch30)} in 30 days: overheated, often followed by a dump")
+        elif ch30 < -40:
+            r.add(-12, f"Down {pct(ch30)} in 30 days: strong downtrend")
+        elif ch30 < -20:
+            r.add(-6, f"Down {pct(ch30)} in 30 days: weakening trend")
+        elif 0 <= ch30 <= 60:
+            r.add(6, f"Steady 30-day trend ({pct(ch30)})")
+    if ch7 is not None and ch7 > 60:
+        r.add(-10, f"Up {pct(ch7)} in 7 days: parabolic move")
+
+    if ath is not None and ath < -90:
+        r.add(-15, f"Down {pct(ath)} from all-time high: most holders are deep underwater")
+    elif ath is not None and ath > -30:
+        r.add(3, f"Near its all-time high ({pct(ath)})")
+
+    if total and circ and circ / total < 0.5:
+        r.add(-10, f"Only {circ / total:.0%} of supply is circulating: future unlocks can dump price")
+
+    return r
+
+
+# ------------------------------------------------------- daily history
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    state = {k: state[k] for k in sorted(state)[-30:]}      # keep last 30 days
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except OSError as e:
+        print(f"(Could not save history: {e})")
+
+
+def show_changes(prev_date, prev, cur):
+    label = lambda d: f"{d['sym']} ({d['name']})"
+    moved, new, dropped, other = [], [], [], []
+
+    for cid, now in cur.items():
+        old = prev.get(cid)
+        if old is None:
+            new.append(f"  NEW in the list: {label(now)} -> {now['v']} (score {now['s']})")
+            continue
+        if old["v"] != now["v"]:
+            word = "UPGRADED" if RANK[now["v"]] > RANK[old["v"]] else "DOWNGRADED"
+            moved.append(f"  {word}: {label(now)}: {old['v']} -> {now['v']} "
+                         f"(score {old['s']} -> {now['s']})")
+        elif abs(now["s"] - old["s"]) >= 8:
+            other.append(f"  SCORE MOVE: {label(now)}: {old['s']} -> {now['s']} "
+                         f"(still {now['v']})")
+        if old.get("m") and now.get("m") and abs(now["m"] / old["m"] - 1) >= 0.20:
+            other.append(f"  BIG MOVE: {label(now)} market cap {now['m'] / old['m'] - 1:+.0%} "
+                         f"({usd(old['m'])} -> {usd(now['m'])})")
+
+    for cid, old in prev.items():
+        if cid not in cur:
+            dropped.append(f"  LEFT the list: {label(old)} (was {old['v']})")
+
+    print(f"\nWHAT CHANGED since {prev_date}")
+    lines = moved + new + dropped + other
+    print("\n".join(lines) if lines else "  No rating changes.")
+
+
+def cmd_scan(args):
+    url = ("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd"
+           "&category=meme-token&order=market_cap_desc"
+           f"&per_page={args.top}&page=1&price_change_percentage=24h,7d,30d")
+    coins = http_json(url)
+    if not isinstance(coins, list) or not coins:
+        sys.exit("CoinGecko returned no data (it may be rate limiting). Try again in a minute.")
+
+    results = [(c, score_gecko(c)) for c in coins]
+    results.sort(key=lambda cr: cr[1].score, reverse=True)
+
+    ch30s = [num(c.get("price_change_percentage_30d_in_currency")) for c in coins
+             if c.get("price_change_percentage_30d_in_currency") is not None]
+    if ch30s:
+        down = sum(1 for x in ch30s if x < 0)
+        print(f"\nMarket: {down} of {len(ch30s)} coins are down over 30 days "
+              f"(median {statistics.median(ch30s):+.0f}%).")
+
+    if not args.no_history:
+        snapshot = {
+            c.get("id"): {"sym": ascii_name(c.get("symbol"), c.get("id")).upper()[:9],
+                          "name": ascii_name(c.get("name"), c.get("id"))[:20],
+                          "v": r.verdict, "s": r.score, "m": num(c.get("market_cap"))}
+            for c, r in results}
+        state = load_state()
+        today = date.today().isoformat()
+        earlier = [d for d in state if d < today]
+        if earlier:
+            show_changes(max(earlier), state[max(earlier)], snapshot)
+        else:
+            print("\nNo earlier day to compare with yet. Changes will show from tomorrow's run.")
+        state[today] = snapshot
+        save_state(state)
+
+    print(f"\n{'Symbol':<10}{'Name':<22}{'MCap':>9}{'7d':>8}{'30d':>8}{'Score':>7}  Verdict")
+    print("-" * 74)
+    for c, r in results:
+        sym = ascii_name(c.get("symbol"), c.get("id")).upper()[:9]
+        nm = ascii_name(c.get("name"), c.get("id"))[:20]
+        print(f"{sym:<10}{nm:<22}{usd(c.get('market_cap')):>9}"
+              f"{pct(c.get('price_change_percentage_7d_in_currency')):>8}"
+              f"{pct(c.get('price_change_percentage_30d_in_currency')):>8}"
+              f"{r.score:>7}  {r.verdict}")
+        if args.detail:
+            r.show()
+    counts = {v: sum(1 for _, r in results if r.verdict == v)
+              for v in ("WATCHLIST", "HIGH RISK", "AVOID")}
+    print(f"\n{counts['WATCHLIST']} watchlist, {counts['HIGH RISK']} high risk, "
+          f"{counts['AVOID']} avoid.")
+    print("WATCHLIST is not a buy signal. Meme coins can lose 90% at any time.\n")
+
+
+# ------------------------------------------------------ any token (DEX)
+def score_dex(p):
+    base = p.get("baseToken", {})
+    r = Result(f"{base.get('name')} ({base.get('symbol')}) on {p.get('chainId')}/{p.get('dexId')}")
+    liq = num((p.get("liquidity") or {}).get("usd"))
+    vol24 = num((p.get("volume") or {}).get("h24"))
+    ch24 = (p.get("priceChange") or {}).get("h24")
+    tx = (p.get("txns") or {}).get("h24") or {}
+    buys, sells = num(tx.get("buys")), num(tx.get("sells"))
+    fdv = num(p.get("fdv"))
+    created = p.get("pairCreatedAt")
+    age_h = (time.time() * 1000 - num(created)) / 3.6e6 if created else None
+
+    if liq < 25_000:
+        r.avoid(f"Liquidity only {usd(liq)}: you probably cannot sell a real position")
+    elif liq < 100_000:
+        r.add(-20, f"Low liquidity ({usd(liq)}): large exit moves the price a lot")
+    elif liq < 500_000:
+        r.add(-5, f"Moderate liquidity ({usd(liq)})")
+    else:
+        r.add(10, f"Solid liquidity ({usd(liq)})")
+
+    if liq >= 1_000_000 and vol24 / liq < 0.005:
+        r.avoid(f"Reported liquidity ({usd(liq)}) but only {usd(vol24)} traded in 24h: "
+                "the liquidity number looks fake or unreliable")
+    elif liq >= 250_000 and vol24 / liq < 0.01:
+        r.add(-25, f"Large liquidity ({usd(liq)}) but almost nobody trades it: may be inflated")
+
+    if age_h is None:
+        r.add(-5, "Pair age unknown")
+    elif age_h < 24:
+        r.avoid(f"Only {age_h:.0f} hours old: no track record, highest rug-pull risk")
+    elif age_h < 24 * 7:
+        r.add(-20, f"Only {age_h / 24:.0f} days old")
+    elif age_h < 24 * 30:
+        r.add(-8, f"Under a month old ({age_h / 24:.0f} days)")
+    elif age_h > 24 * 90:
+        r.add(10, f"Has survived {age_h / 24:.0f} days")
+
+    if buys >= 30 and sells == 0:
+        r.avoid(f"{buys:.0f} buys and ZERO sells in 24h: classic honeypot (cannot sell) pattern")
+    elif buys >= 50 and sells < 0.2 * buys:
+        r.add(-15, f"Almost no sells ({sells:.0f} vs {buys:.0f} buys): possible sell restrictions")
+
+    if vol24 < 10_000:
+        r.add(-15, f"Barely traded ({usd(vol24)} in 24h)")
+    elif liq and vol24 / liq > 30:
+        r.add(-15, f"Volume is {vol24 / liq:.0f}x liquidity: wash trading or pump in progress")
+    if buys + sells < 100:
+        r.add(-10, f"Only {buys + sells:.0f} trades in 24h: thin activity")
+
+    if ch24 is not None:
+        if num(ch24) > 300:
+            r.add(-20, f"Up {pct(ch24)} in 24h: parabolic pump, usually followed by a crash")
+        elif num(ch24) > 100:
+            r.add(-10, f"Up {pct(ch24)} in 24h")
+        elif num(ch24) < -60:
+            r.add(-20, f"Down {pct(ch24)} in 24h: collapsing")
+        elif num(ch24) < -30:
+            r.add(-10, f"Down {pct(ch24)} in 24h")
+
+    if liq and fdv / liq > 200:
+        r.add(-15, f"Valuation ({usd(fdv)}) is {fdv / liq:.0f}x the liquidity: price is easy to crash")
+    elif liq and fdv / liq > 50:
+        r.add(-7, f"Valuation ({usd(fdv)}) is large vs liquidity")
+
+    return r
+
+
+def cmd_check(args):
+    q = args.query.strip()
+    data = http_json("https://api.dexscreener.com/latest/dex/search?q=" + urllib.parse.quote(q))
+    pairs = (data or {}).get("pairs") or []
+    if not pairs:
+        sys.exit("No pairs found. Try the contract address instead.")
+
+    is_addr = len(q) >= 32 and " " not in q
+    if is_addr:
+        pairs = [p for p in pairs if p.get("baseToken", {}).get("address", "").lower() == q.lower()]
+    else:
+        up = q.upper()
+        exact = [p for p in pairs if str(p.get("baseToken", {}).get("symbol", "")).upper() == up]
+        pairs = exact or pairs
+    if not pairs:
+        sys.exit("No matching token found.")
+
+    best = {}   # one pair per token: the one with the most liquidity
+    for p in pairs:
+        addr = p.get("baseToken", {}).get("address", "")
+        liq = num((p.get("liquidity") or {}).get("usd"))
+        if addr not in best or liq > num((best[addr].get("liquidity") or {}).get("usd")):
+            best[addr] = p
+    ranked = sorted(best.values(),
+                    key=lambda p: num((p.get("liquidity") or {}).get("usd")), reverse=True)
+
+    if not is_addr and len(ranked) > 1:
+        print(f"\n{len(ranked)} different tokens use this name. Scammers copy popular "
+              "tickers, so confirm the contract address before trusting any of them. "
+              "For established coins (DOGE, SHIB, PEPE) use the 'scan' command instead.")
+
+    for p in ranked[:args.max]:
+        r = score_dex(p)
+        if not is_addr:
+            r.cap = True
+            r.add(0, "Found by name/ticker, not contract address: cannot confirm this is "
+                     "the token you mean")
+        base = p.get("baseToken", {})
+        print(f"\n=== {r.label} ===")
+        print(f"Contract: {base.get('address')}")
+        print(f"Price ${p.get('priceUsd')} | liquidity {usd((p.get('liquidity') or {}).get('usd'))} "
+              f"| 24h volume {usd((p.get('volume') or {}).get('h24'))} "
+              f"| 24h change {pct((p.get('priceChange') or {}).get('h24'))}")
+        print(f"VERDICT: {r.verdict}   (score {r.score}/100)")
+        r.show()
+
+    print("\nNOT CHECKED (this tool cannot see these; check them yourself before any buy):")
+    print("  - Can the creator mint more tokens or change the rules?")
+    print("  - Does one wallet (or a few) hold most of the supply?")
+    print("  - Is the liquidity locked or burned?")
+    print("  Free checkers: rugcheck.xyz (Solana), tokensniffer / honeypot.is (Ethereum, Base, BSC).\n")
+
+
+# ---------------------------------------------------------------- main
+def main():
+    p = argparse.ArgumentParser(description="Meme coin risk screener")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("scan", help="rate the top meme coins")
+    s.add_argument("--top", type=int, default=30)
+    s.add_argument("--detail", action="store_true", help="show reasons for each coin")
+    s.add_argument("--no-history", action="store_true",
+                   help="do not compare with or save to the daily history")
+    s.set_defaults(fn=cmd_scan)
+
+    c = sub.add_parser("check", help="check one token by name, ticker or contract address")
+    c.add_argument("query")
+    c.add_argument("--max", type=int, default=3, help="max tokens to show")
+    c.set_defaults(fn=cmd_check)
+
+    args = p.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
